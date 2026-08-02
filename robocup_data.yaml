@@ -1,0 +1,17 @@
+# RoboCup 目标检测数据集配置
+# 当前数据集根目录：D:\Projects\gedou_vision\dataset\robocup
+path: dataset/robocup
+
+# 训练集与验证集目录
+# 脚本会在必要时自动把 labels/tarin 复制成 labels/train，并自动切分出 val
+train: images/train
+val: images/val
+
+# 类别数
+nc: 3
+
+# 类别名称
+names:
+  0: buff_block
+  1: debuff_block
+  2: other_block
