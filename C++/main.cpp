@@ -1,12 +1,19 @@
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include <opencv2/opencv.hpp>
 #include <net.h>
@@ -16,12 +23,18 @@ struct Options
     std::string model_param = "model.ncnn.param";
     std::string model_bin = "model.ncnn.bin";
     std::string serial_port = "/dev/ttyUSB0";
+    std::string remote_ip = "192.168.139.200";
+    int remote_port = 8888;
+    int udp_quality = 60;
+    int udp_fps = 15;
+    int udp_chunk_size = 1200;
     int camera_index = 0;
     int input_size = 320;
     int baudrate = 115200;
     float conf_thres = 0.25f;
     float nms_thres = 0.45f;
-    bool show_window = true;
+    bool enable_udp = true;
+    bool show_window = false;
 };
 
 struct LetterboxInfo
@@ -92,6 +105,26 @@ static Options parse_args(int argc, char **argv)
         {
             opt.serial_port = need_value(arg);
         }
+        else if (arg == "--ip")
+        {
+            opt.remote_ip = need_value(arg);
+        }
+        else if (arg == "--port")
+        {
+            opt.remote_port = std::stoi(need_value(arg));
+        }
+        else if (arg == "--udp-quality")
+        {
+            opt.udp_quality = std::stoi(need_value(arg));
+        }
+        else if (arg == "--udp-fps")
+        {
+            opt.udp_fps = std::stoi(need_value(arg));
+        }
+        else if (arg == "--udp-chunk")
+        {
+            opt.udp_chunk_size = std::stoi(need_value(arg));
+        }
         else if (arg == "--camera")
         {
             opt.camera_index = std::stoi(need_value(arg));
@@ -112,12 +145,118 @@ static Options parse_args(int argc, char **argv)
         {
             opt.nms_thres = std::stof(need_value(arg));
         }
+        else if (arg == "--no-udp")
+        {
+            opt.enable_udp = false;
+        }
+        else if (arg == "--show")
+        {
+            opt.show_window = true;
+        }
         else if (arg == "--no-show")
         {
             opt.show_window = false;
         }
     }
     return opt;
+}
+
+static void validate_udp_options(const Options &opt)
+{
+    if (opt.remote_port < 1 || opt.remote_port > 65535)
+    {
+        throw std::runtime_error("UDP port must be between 1 and 65535");
+    }
+    if (opt.udp_quality < 1 || opt.udp_quality > 100)
+    {
+        throw std::runtime_error("UDP JPEG quality must be between 1 and 100");
+    }
+    if (opt.udp_fps < 0)
+    {
+        throw std::runtime_error("UDP FPS must be zero or greater");
+    }
+    if (opt.udp_chunk_size < 256 || opt.udp_chunk_size > 1400)
+    {
+        throw std::runtime_error("UDP chunk size must be between 256 and 1400 bytes");
+    }
+}
+
+static bool create_udp_target(const Options &opt, int &socket_fd, sockaddr_in &target)
+{
+    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd < 0)
+    {
+        std::cerr << "Failed to create UDP socket: " << std::strerror(errno) << std::endl;
+        return false;
+    }
+
+    target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(static_cast<uint16_t>(opt.remote_port));
+    if (inet_pton(AF_INET, opt.remote_ip.c_str(), &target.sin_addr) != 1)
+    {
+        std::cerr << "Invalid UDP destination IP: " << opt.remote_ip << std::endl;
+        close(socket_fd);
+        socket_fd = -1;
+        return false;
+    }
+
+    return true;
+}
+
+static bool send_jpeg_udp(int socket_fd,
+                          const sockaddr_in &target,
+                          const std::vector<uchar> &jpeg,
+                          uint32_t frame_id,
+                          int chunk_size)
+{
+    // Keep datagrams below the usual Wi-Fi MTU. The receiver uses this header
+    // to discard incomplete frames and reassemble complete JPEGs.
+    constexpr size_t header_size = 12;
+    if (jpeg.empty() || chunk_size < static_cast<int>(header_size))
+    {
+        return false;
+    }
+
+    const size_t payload_size = static_cast<size_t>(chunk_size) - header_size;
+    const size_t chunk_count = (jpeg.size() + payload_size - 1) / payload_size;
+    if (chunk_count == 0 || chunk_count > std::numeric_limits<uint16_t>::max())
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> packet(header_size + payload_size);
+    packet[0] = 'G';
+    packet[1] = 'D';
+    packet[2] = 'U';
+    packet[3] = '1';
+
+    const uint32_t network_frame_id = htonl(frame_id);
+    std::memcpy(packet.data() + 4, &network_frame_id, sizeof(network_frame_id));
+
+    const uint16_t network_chunk_count = htons(static_cast<uint16_t>(chunk_count));
+    std::memcpy(packet.data() + 8, &network_chunk_count, sizeof(network_chunk_count));
+
+    for (size_t chunk_id = 0; chunk_id < chunk_count; ++chunk_id)
+    {
+        const size_t offset = chunk_id * payload_size;
+        const size_t bytes = std::min(payload_size, jpeg.size() - offset);
+        const uint16_t network_chunk_id = htons(static_cast<uint16_t>(chunk_id));
+        std::memcpy(packet.data() + 10, &network_chunk_id, sizeof(network_chunk_id));
+        std::memcpy(packet.data() + header_size, jpeg.data() + offset, bytes);
+
+        const ssize_t sent = sendto(socket_fd,
+                                    packet.data(),
+                                    header_size + bytes,
+                                    0,
+                                    reinterpret_cast<const sockaddr *>(&target),
+                                    sizeof(target));
+        if (sent != static_cast<ssize_t>(header_size + bytes))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 static int open_serial(const std::string &port_name, int baudrate)
@@ -160,18 +299,24 @@ static int open_serial(const std::string &port_name, int baudrate)
     return fd;
 }
 
-static void send_delta(int fd, int16_t delta_x)
+static void send_target_data(int fd, bool found, int16_t delta_x, int16_t distance)
 {
     if (fd < 0)
     {
         return;
     }
 
-    uint8_t packet[4];
+    uint8_t packet[8];
     packet[0] = 0xAA;
-    packet[1] = static_cast<uint8_t>((delta_x >> 8) & 0xFF);
-    packet[2] = static_cast<uint8_t>(delta_x & 0xFF);
-    packet[3] = 0xBB;
+    packet[1] = found ? 0x01 : 0x00;
+    packet[2] = static_cast<uint8_t>((delta_x >> 8) & 0xFF);
+    packet[3] = static_cast<uint8_t>(delta_x & 0xFF);
+    packet[4] = static_cast<uint8_t>((distance >> 8) & 0xFF);
+    packet[5] = static_cast<uint8_t>(distance & 0xFF);
+    packet[6] = static_cast<uint8_t>((packet[1] + packet[2] + packet[3] +
+                                      packet[4] + packet[5]) &
+                                     0xFF);
+    packet[7] = 0xBB;
     (void)write(fd, packet, sizeof(packet));
 }
 
@@ -194,21 +339,6 @@ static LetterboxInfo letterbox(const cv::Mat &src, cv::Mat &dst, int size)
     return info;
 }
 
-static inline float get_out_value(const ncnn::Mat &out, int row, int col)
-{
-    if (out.dims != 2)
-    {
-        return 0.0f;
-    }
-
-    if (out.h <= out.w)
-    {
-        return out.row(row)[col];
-    }
-
-    return out.row(col)[row];
-}
-
 static std::vector<Detection> decode_detections(const ncnn::Mat &out,
                                                 int img_w,
                                                 int img_h,
@@ -216,34 +346,47 @@ static std::vector<Detection> decode_detections(const ncnn::Mat &out,
                                                 float conf_thres,
                                                 float nms_thres)
 {
-    std::vector<cv::Rect> boxes;
+    if (out.dims != 2)
+    {
+        throw std::runtime_error("Unexpected NCNN output: expected a 2-D tensor");
+    }
+
+    std::vector<cv::Rect2d> boxes;
     std::vector<float> scores;
     std::vector<int> class_ids;
 
     const int num_candidates = (out.h <= out.w) ? out.w : out.h;
+    const int num_attributes = (out.h <= out.w) ? out.h : out.w;
     const bool normal_layout = (out.h <= out.w);
+    const int num_classes = num_attributes - 4;
+    if (num_classes < 2)
+    {
+        throw std::runtime_error("Unexpected NCNN output: fewer than two class scores");
+    }
+
+    auto value_at = [&](int attribute, int candidate) -> float
+    {
+        return normal_layout ? out.row(attribute)[candidate]
+                             : out.row(candidate)[attribute];
+    };
 
     for (int i = 0; i < num_candidates; ++i)
     {
-        float v0 = normal_layout ? out.row(0)[i] : out.row(i)[0];
-        float v1 = normal_layout ? out.row(1)[i] : out.row(i)[1];
-        float v2 = normal_layout ? out.row(2)[i] : out.row(i)[2];
-        float v3 = normal_layout ? out.row(3)[i] : out.row(i)[3];
-        float s0 = normal_layout ? out.row(4)[i] : out.row(i)[4];
-        float s1 = normal_layout ? out.row(5)[i] : out.row(i)[5];
-        float s2 = normal_layout ? out.row(6)[i] : out.row(i)[6];
+        const float cx = value_at(0, i);
+        const float cy = value_at(1, i);
+        const float w = value_at(2, i);
+        const float h = value_at(3, i);
 
         int class_id = 0;
-        float score = s0;
-        if (s1 > score)
+        float score = value_at(4, i);
+        for (int c = 1; c < num_classes; ++c)
         {
-            score = s1;
-            class_id = 1;
-        }
-        if (s2 > score)
-        {
-            score = s2;
-            class_id = 2;
+            const float class_score = value_at(4 + c, i);
+            if (class_score > score)
+            {
+                score = class_score;
+                class_id = c;
+            }
         }
 
         if (score < conf_thres)
@@ -251,25 +394,12 @@ static std::vector<Detection> decode_detections(const ncnn::Mat &out,
             continue;
         }
 
-        float x1, y1, x2, y2;
-        if (v2 > v0 && v3 > v1)
-        {
-            x1 = v0;
-            y1 = v1;
-            x2 = v2;
-            y2 = v3;
-        }
-        else
-        {
-            const float cx = v0;
-            const float cy = v1;
-            const float w = v2;
-            const float h = v3;
-            x1 = cx - w * 0.5f;
-            y1 = cy - h * 0.5f;
-            x2 = cx + w * 0.5f;
-            y2 = cy + h * 0.5f;
-        }
+        // Ultralytics' non-end-to-end NCNN export emits cx, cy, width, height.
+        // Never guess xyxy from the values: that breaks boxes near the top/left edge.
+        float x1 = cx - w * 0.5f;
+        float y1 = cy - h * 0.5f;
+        float x2 = cx + w * 0.5f;
+        float y2 = cy + h * 0.5f;
 
         x1 = (x1 - lb.pad_x) / lb.scale;
         y1 = (y1 - lb.pad_y) / lb.scale;
@@ -288,14 +418,36 @@ static std::vector<Detection> decode_detections(const ncnn::Mat &out,
             continue;
         }
 
-        boxes.emplace_back(cv::Rect(cv::Point(static_cast<int>(x1), static_cast<int>(y1)),
-                                    cv::Size(static_cast<int>(bw), static_cast<int>(bh))));
+        boxes.emplace_back(static_cast<double>(x1), static_cast<double>(y1),
+                           static_cast<double>(bw), static_cast<double>(bh));
         scores.emplace_back(score);
         class_ids.emplace_back(class_id);
     }
 
+    // Run NMS per class so an overlapping buff and debuff do not suppress each other.
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(boxes, scores, conf_thres, nms_thres, keep);
+    for (int class_id = 0; class_id < num_classes; ++class_id)
+    {
+        std::vector<cv::Rect2d> class_boxes;
+        std::vector<float> class_scores;
+        std::vector<int> source_indices;
+        for (size_t i = 0; i < boxes.size(); ++i)
+        {
+            if (class_ids[i] == class_id)
+            {
+                class_boxes.push_back(boxes[i]);
+                class_scores.push_back(scores[i]);
+                source_indices.push_back(static_cast<int>(i));
+            }
+        }
+
+        std::vector<int> class_keep;
+        cv::dnn::NMSBoxes(class_boxes, class_scores, conf_thres, nms_thres, class_keep);
+        for (int idx : class_keep)
+        {
+            keep.push_back(source_indices[idx]);
+        }
+    }
 
     std::vector<Detection> detections;
     detections.reserve(keep.size());
@@ -358,11 +510,21 @@ int main(int argc, char **argv)
     try
     {
         Options opt = parse_args(argc, argv);
+        if (opt.enable_udp)
+        {
+            validate_udp_options(opt);
+        }
 
         ncnn::Net net;
-        net.load_param(opt.model_param.c_str());
-        net.load_model(opt.model_bin.c_str());
         net.opt.num_threads = std::max(1, cv::getNumberOfCPUs() - 1);
+        if (net.load_param(opt.model_param.c_str()) != 0)
+        {
+            throw std::runtime_error("Failed to load NCNN param: " + opt.model_param);
+        }
+        if (net.load_model(opt.model_bin.c_str()) != 0)
+        {
+            throw std::runtime_error("Failed to load NCNN weights: " + opt.model_bin);
+        }
 
         int serial_fd = open_serial(opt.serial_port, opt.baudrate);
         cv::VideoCapture cap(opt.camera_index, cv::CAP_V4L2);
@@ -380,10 +542,33 @@ int main(int argc, char **argv)
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, 240);
         cap.set(cv::CAP_PROP_FPS, 30);
 
+        int udp_sock = -1;
+        sockaddr_in udp_target{};
+        if (opt.enable_udp && !create_udp_target(opt, udp_sock, udp_target))
+        {
+            if (serial_fd >= 0)
+            {
+                close(serial_fd);
+            }
+            cap.release();
+            return 1;
+        }
+
+        if (opt.enable_udp)
+        {
+            std::cout << "UDP video target: " << opt.remote_ip << ":" << opt.remote_port << std::endl;
+        }
+        uint32_t udp_frame_id = 0;
+        const int64_t udp_interval_ticks = opt.udp_fps > 0
+                                               ? static_cast<int64_t>(cv::getTickFrequency() / opt.udp_fps)
+                                               : 0;
+        int64_t last_udp_tick = 0;
+
         cv::Mat frame;
         cv::Mat letterboxed;
         cv::Mat display;
-        float fps_ema = 0.0f;
+        float infer_fps_ema = 0.0f;
+        float loop_fps_ema = 0.0f;
 
         if (opt.show_window)
         {
@@ -406,55 +591,93 @@ int main(int argc, char **argv)
             in.substract_mean_normalize(nullptr, norm_vals);
 
             ncnn::Extractor ex = net.create_extractor();
-            ex.input("in0", in);
+            if (ex.input("in0", in) != 0)
+            {
+                throw std::runtime_error("Failed to set NCNN input tensor 'in0'");
+            }
 
             ncnn::Mat out;
-            ex.extract("out0", out);
+            if (ex.extract("out0", out) != 0)
+            {
+                throw std::runtime_error("Failed to extract NCNN output tensor 'out0'");
+            }
 
             std::vector<Detection> detections = decode_detections(
                 out, frame.cols, frame.rows, lb, opt.conf_thres, opt.nms_thres);
 
-            int16_t delta_x = 999;
+            int16_t delta_x = 0;
+            int16_t distance = 0;
             bool found = false;
-            if (!detections.empty())
+            float max_area = 0.0f;
+
+            // Only buff_block (class 0) is a valid target. Among those targets,
+            // the largest box is treated as the nearest physical block.
+            for (const auto &det : detections)
             {
-                const Detection &best = detections.front();
-                const float cx = best.box.x + best.box.width * 0.5f;
+                if (det.class_id != 0)
+                {
+                    continue;
+                }
+
+                const float area = det.box.width * det.box.height;
+                if (area <= max_area || det.box.width <= 0.0f)
+                {
+                    continue;
+                }
+
+                max_area = area;
+                const float cx = det.box.x + det.box.width * 0.5f;
                 delta_x = static_cast<int16_t>(std::round(cx - frame.cols * 0.5f));
+                distance = static_cast<int16_t>(std::round(5000.0f / det.box.width));
                 found = true;
             }
-
-            if (found)
-            {
-                send_delta(serial_fd, delta_x);
-            }
-            else
-            {
-                send_delta(serial_fd, 999);
-            }
+            // 串口通信发送
+            send_target_data(serial_fd, found, delta_x, distance);
 
             display = frame.clone();
             draw_detections(display, detections);
 
             const float instant_fps = static_cast<float>(cv::getTickFrequency() / (cv::getTickCount() - t0));
-            if (fps_ema <= 0.0f)
+            if (infer_fps_ema <= 0.0f)
             {
-                fps_ema = instant_fps;
+                infer_fps_ema = instant_fps;
             }
             else
             {
-                fps_ema = 0.9f * fps_ema + 0.1f * instant_fps;
+                infer_fps_ema = 0.9f * infer_fps_ema + 0.1f * instant_fps;
             }
 
-            std::string fps_text = "FPS: " + cv::format("%.1f", fps_ema);
+            std::string fps_text = "Infer FPS: " + cv::format("%.1f", infer_fps_ema);
             cv::putText(display, fps_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
                         0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            if (loop_fps_ema > 0.0f)
+            {
+                std::string loop_text = "Loop FPS: " + cv::format("%.1f", loop_fps_ema);
+                cv::putText(display, loop_text, cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
+                            0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            }
 
             if (found)
             {
                 std::string dx_text = "dx: " + std::to_string(delta_x);
-                cv::putText(display, dx_text, cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
+                cv::putText(display, dx_text, cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
                             0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            }
+
+            const int64_t now_tick = cv::getTickCount();
+            const bool send_udp_frame = opt.enable_udp &&
+                                        (opt.udp_fps == 0 ||
+                                         last_udp_tick == 0 ||
+                                         now_tick - last_udp_tick >= udp_interval_ticks);
+            if (send_udp_frame)
+            {
+                std::vector<uchar> jpeg;
+                const std::vector<int> jpeg_params = {cv::IMWRITE_JPEG_QUALITY, opt.udp_quality};
+                if (cv::imencode(".jpg", display, jpeg, jpeg_params) &&
+                    send_jpeg_udp(udp_sock, udp_target, jpeg, udp_frame_id++, opt.udp_chunk_size))
+                {
+                    last_udp_tick = now_tick;
+                }
             }
 
             if (opt.show_window)
@@ -466,11 +689,26 @@ int main(int argc, char **argv)
                     break;
                 }
             }
+
+            const float loop_fps = static_cast<float>(
+                cv::getTickFrequency() / (cv::getTickCount() - t0));
+            if (loop_fps_ema <= 0.0f)
+            {
+                loop_fps_ema = loop_fps;
+            }
+            else
+            {
+                loop_fps_ema = 0.9f * loop_fps_ema + 0.1f * loop_fps;
+            }
         }
 
         if (serial_fd >= 0)
         {
             close(serial_fd);
+        }
+        if (udp_sock >= 0)
+        {
+            close(udp_sock);
         }
         cap.release();
         if (opt.show_window)
