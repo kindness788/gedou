@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>RoboCup 视觉图传监控端</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; margin: 0; padding: 20px; }
+        .config-box { background: #1e1e1e; padding: 15px; border-radius: 8px; display: inline-block; margin-bottom: 20px; }
+        input { padding: 8px; margin: 0 5px; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; }
+        button { padding: 8px 15px; background: #007bff; border: none; color: white; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #video-container { margin-top: 10px; }
+        img { max-width: 640px; border: 2px solid #333; border-radius: 4px; background: #000; }
+    </style>
+    <!-- 引入 Socket.IO 客户端库 -->
+    <script src="https://cdn.bootcdn.net/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
+</head>
+<body>
+    <h1>RoboCup 智能车视觉实时图传</h1>
+    
+    <div class="config-box">
+        <label>树莓派 IP:</label>
+        <input type="text" id="pi-ip" value="192.168.1.100">
+        <label>端口:</label>
+        <input type="text" id="pi-port" value="8888" style="width: 80px;">
+        <button onclick="updateConfig()">应用配置</button>
+    </div>
+
+    <div id="video-container">
+        <h3>实时监控画面</h3>
+        <img id="videoStream" src="" alt="等待图传信号中...">
+    </div>
+
+    <script>
+        // 连接到本地 Flask-SocketIO 服务
+        const socket = io();
+        const imgElement = document.getElementById('videoStream');
+
+        function updateConfig() {
+            const ip = document.getElementById('pi-ip').value;
+            const port = document.getElementById('pi-port').value;
+            alert("配置已记录！请确保树莓派程序已指向目标 IP: " + ip + ":" + port);
+            // 可以在这里通过 socket 向后端同步更新目标地址
+        }
+
+        // 监听来自后端中转的视频帧
+        socket.on('video_frame', function(data) {
+            // 将二进制 JPEG 数据转换为 Blob URL 并渲染到 img 标签
+            const blob = new Blob([data.image], { type: 'image/jpeg' });
+            const imageUrl = URL.createObjectURL(blob);
+            
+            // 替换图片源并释放上一次的内存
+            imgElement.onload = function() {
+                URL.revokeObjectURL(imageUrl);
+            };
+            imgElement.src = imageUrl;
+        });
+    </script>
+</body>
+</html>

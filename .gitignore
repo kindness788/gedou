@@ -1,0 +1,27 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# Python虚拟环境
+.venv/
+venv/
+
+# C++编译产物
+C++/build/
+build/
+
+# 训练输出和权重
+runs/
+*.pt
+*.onnx
+*.engine
+
+# 数据集
+dataset/
+
+# 压缩文件
+*.zip
+
+# 编辑器配置
+.vscode/

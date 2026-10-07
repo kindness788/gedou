@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +22,11 @@ DEFAULT_BIND_PORT = 8888
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8000
 MAX_UDP_PACKET = 65535
+GDU_HEADER = struct.Struct("!4sIHH")
+GDU_MAGIC = b"GDU1"
+ASSEMBLY_TIMEOUT = 0.75
+MAX_CHUNKS_PER_FRAME = 4096
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -30,6 +36,63 @@ class FrameInfo:
     jpeg_bytes: bytes = b""
     width: int = 0
     height: int = 0
+
+
+@dataclass
+class PendingFrame:
+    chunk_count: int
+    first_seen: float
+    total_bytes: int = 0
+    chunks: dict[int, bytes] = field(default_factory=dict)
+
+
+class GduFrameAssembler:
+    """Reassemble the GDU1 UDP chunks emitted by C++/main.cpp."""
+
+    def __init__(self) -> None:
+        self._pending: dict[tuple[str, int, int], PendingFrame] = {}
+
+    def _expire(self, now: float) -> None:
+        stale = [
+            key
+            for key, frame in self._pending.items()
+            if now - frame.first_seen > ASSEMBLY_TIMEOUT
+        ]
+        for key in stale:
+            del self._pending[key]
+
+    def add(self, data: bytes, addr: tuple[str, int]) -> bytes | None:
+        if len(data) < GDU_HEADER.size or data[:4] != GDU_MAGIC:
+            return data
+
+        magic, frame_id, chunk_count, chunk_id = GDU_HEADER.unpack_from(data)
+        if magic != GDU_MAGIC:
+            return None
+        if not 0 < chunk_count <= MAX_CHUNKS_PER_FRAME or chunk_id >= chunk_count:
+            return None
+
+        now = time.monotonic()
+        self._expire(now)
+        key = (addr[0], addr[1], frame_id)
+        frame = self._pending.get(key)
+        if frame is None or frame.chunk_count != chunk_count:
+            frame = PendingFrame(chunk_count=chunk_count, first_seen=now)
+            self._pending[key] = frame
+
+        payload = data[GDU_HEADER.size :]
+        previous = frame.chunks.get(chunk_id)
+        if previous is None:
+            frame.chunks[chunk_id] = payload
+            frame.total_bytes += len(payload)
+        if frame.total_bytes > MAX_FRAME_BYTES:
+            del self._pending[key]
+            return None
+        if len(frame.chunks) != frame.chunk_count:
+            return None
+
+        jpeg = b"".join(frame.chunks[index] for index in range(frame.chunk_count))
+        del self._pending[key]
+        return jpeg
 
 
 class FrameStore:
@@ -81,6 +144,7 @@ class UdpReceiver(threading.Thread):
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._sock = None
+        self._assembler = GduFrameAssembler()
 
     def current_bind(self) -> tuple[str, int]:
         with self._lock:
@@ -142,7 +206,7 @@ class UdpReceiver(threading.Thread):
                         if sock is not self._sock:
                             break
                     try:
-                        data, _addr = sock.recvfrom(MAX_UDP_PACKET)
+                        data, addr = sock.recvfrom(MAX_UDP_PACKET)
                     except TimeoutError:
                         continue
                     except OSError:
@@ -150,12 +214,18 @@ class UdpReceiver(threading.Thread):
                     if not data:
                         continue
 
-                    arr = np.frombuffer(data, dtype=np.uint8)
+                    jpeg_bytes = self._assembler.add(data, addr)
+                    if jpeg_bytes is None:
+                        continue
+
+                    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
                     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                     if image is None:
                         continue
 
-                    self._store.update(data, int(image.shape[1]), int(image.shape[0]))
+                    self._store.update(
+                        jpeg_bytes, int(image.shape[1]), int(image.shape[0])
+                    )
             finally:
                 try:
                     sock.close()

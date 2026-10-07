@@ -4,23 +4,26 @@ YOLO26n 训练与导出脚本。
 功能：
 1. 自动识别数据集目录
 2. 兼容 labels/train 和 labels/tarin
-3. 如果没有 val，则自动从 train 中切分一部分作为验证集
+3. 训练前强制执行数据审计，拒绝连续帧泄漏和缺失类别
 4. 训练 YOLO 检测模型
 5. 训练完成后自动导出 best.pt 为 NCNN 格式
 """
 
 from __future__ import annotations
 
-import random
 import shutil
+import subprocess
+import sys
 import warnings
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent
+
 import torch
+import ultralytics
 from ultralytics import YOLO
 
 
-ROOT = Path(__file__).resolve().parent
 DATASET_ROOT_CANDIDATES = [
     ROOT / "dataset" / "robocup",
     ROOT / "datasets" / "robocup",
@@ -28,13 +31,13 @@ DATASET_ROOT_CANDIDATES = [
 DATA_YAML = ROOT / "robocup_data.yaml"
 PRETRAINED_WEIGHTS = "yolo26n.pt"
 PROJECT_DIR = ROOT / "runs" / "detect"
-RUN_NAME = "train"
+RUN_NAME = "train_clean"
 IMG_SIZE = 320
 EPOCHS = 150
 DEFAULT_BATCH = 16
-VAL_RATIO = 0.1
 SEED = 42
 BEST_WEIGHTS = PROJECT_DIR / RUN_NAME / "weights" / "best.pt"
+EXPECTED_ULTRALYTICS_VERSION = "8.4.21"
 
 
 def resolve_dataset_root() -> Path:
@@ -44,15 +47,6 @@ def resolve_dataset_root() -> Path:
             return candidate
     raise FileNotFoundError(
         "未找到数据集根目录，请确认存在 dataset/robocup 或 datasets/robocup。"
-    )
-
-
-def list_images(image_dir: Path) -> list[Path]:
-    """列出图片文件。"""
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    return sorted(
-        p for p in image_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in exts
     )
 
 
@@ -84,46 +78,17 @@ def ensure_train_labels(dataset_root: Path) -> Path:
     raise FileNotFoundError(f"未找到标签目录：{standard_train} 或 {typo_train}")
 
 
-def split_val_set(dataset_root: Path, train_labels_dir: Path) -> None:
-    """
-    如果没有 val，则从训练集中自动切出一份验证集。
-    这里使用复制，不修改原始数据。
-    """
-    images_train = dataset_root / "images" / "train"
-    images_val = dataset_root / "images" / "val"
-    labels_val = dataset_root / "labels" / "val"
-
-    if images_val.exists() and labels_val.exists():
-        return
-
-    images = list_images(images_train)
-    if not images:
-        raise FileNotFoundError(f"训练图片目录为空：{images_train}")
-
-    paired = []
-    for img_path in images:
-        label_path = train_labels_dir / f"{img_path.stem}.txt"
-        if label_path.exists():
-            paired.append((img_path, label_path))
-        else:
-            warnings.warn(f"跳过缺失标签的图片：{img_path.name}", RuntimeWarning)
-
-    if len(paired) < 2:
-        warnings.warn("可用于切分的样本太少，暂不自动创建 val。", RuntimeWarning)
-        return
-
-    random.seed(SEED)
-    random.shuffle(paired)
-
-    val_count = max(1, int(len(paired) * VAL_RATIO))
-    val_pairs = paired[:val_count]
-
-    images_val.mkdir(parents=True, exist_ok=True)
-    labels_val.mkdir(parents=True, exist_ok=True)
-
-    for img_path, label_path in val_pairs:
-        shutil.copy2(img_path, images_val / img_path.name)
-        shutil.copy2(label_path, labels_val / label_path.name)
+def audit_dataset(dataset_root: Path) -> None:
+    """在训练前检查标签、类别、会话隔离和划分清单是否仍然有效。"""
+    command = [
+        sys.executable,
+        "-X",
+        "utf8",
+        str(ROOT / "dataset_audit.py"),
+        "--dataset",
+        str(dataset_root),
+    ]
+    subprocess.run(command, check=True)
 
 
 def detect_class_ids(labels_dir: Path) -> set[int]:
@@ -151,11 +116,19 @@ def build_train_kwargs() -> dict:
         "batch": DEFAULT_BATCH,
         "mosaic": 0.5,
         "degrees": 15,
-        "bgr": 0.2,
+        "translate": 0.15,
+        "scale": 0.5,
+        "perspective": 0.001,
+        "hsv_h": 0.01,
+        "hsv_s": 0.5,
+        "hsv_v": 0.4,
+        # 类别本身依赖红/紫与黄绿/蓝图案，不使用不真实的 BGR 通道互换。
+        "bgr": 0.0,
         "project": str(PROJECT_DIR),
         "name": RUN_NAME,
         "exist_ok": True,
         "close_mosaic": 10,
+        "seed": SEED,
         "device": 0 if torch.cuda.is_available() else "cpu",
     }
 
@@ -219,15 +192,20 @@ def export_best_to_ncnn() -> Path:
 
 def main() -> None:
     """主流程：准备数据 -> 训练 -> 导出。"""
+    if ultralytics.__version__ != EXPECTED_ULTRALYTICS_VERSION:
+        warnings.warn(
+            f"建议使用 ultralytics=={EXPECTED_ULTRALYTICS_VERSION}，"
+            f"当前为 {ultralytics.__version__}，指标与导出后处理可能不同。",
+            RuntimeWarning,
+        )
     dataset_root = resolve_dataset_root()
     train_labels_dir = ensure_train_labels(dataset_root)
-    split_val_set(dataset_root, train_labels_dir)
+    audit_dataset(dataset_root)
 
     class_ids = detect_class_ids(train_labels_dir)
-    if class_ids == {0}:
-        warnings.warn(
-            "当前标签里只检测到类别 0。若你要训练 3 类，请确认 1、2 类也已标注。",
-            RuntimeWarning,
+    if class_ids != {0, 1}:
+        raise RuntimeError(
+            f"期望训练类别为 0/1（增益/减益），实际检测到：{sorted(class_ids)}"
         )
 
     if not DATA_YAML.exists():

@@ -35,6 +35,7 @@ struct Options
     int yolo_interval = 3;
     int min_track_points = 6;
     int baudrate = 115200;
+    float distance_threshold = 50.0f;
     float conf_thres = 0.25f;
     float nms_thres = 0.45f;
     float min_hsv_ratio = 0.008f;
@@ -162,6 +163,10 @@ static Options parse_args(int argc, char **argv)
         {
             opt.baudrate = std::stoi(need_value(arg));
         }
+        else if (arg == "--distance-threshold")
+        {
+            opt.distance_threshold = std::stof(need_value(arg));
+        }
         else if (arg == "--conf")
         {
             opt.conf_thres = std::stof(need_value(arg));
@@ -198,6 +203,10 @@ static Options parse_args(int argc, char **argv)
     if (opt.min_hsv_ratio < 0.0f || opt.min_hsv_ratio > 1.0f)
     {
         throw std::runtime_error("--hsv-ratio must be between 0 and 1");
+    }
+    if (!std::isfinite(opt.distance_threshold) || opt.distance_threshold <= 0.0f)
+    {
+        throw std::runtime_error("--distance-threshold must be a positive finite number");
     }
     return opt;
 }
@@ -340,26 +349,47 @@ static int open_serial(const std::string &port_name, int baudrate)
     return fd;
 }
 
-static void send_target_data(int fd, uint8_t target_type, int16_t delta_x, int16_t distance)
+// Bit 0: debuff present; bit 1: buff present; bits 2/3: debuff/buff left;
+// bit 4: priority target within distance threshold; bits 5..7: reserved.
+static uint8_t encode_target_status(const Detection *debuff,
+                                    const Detection *buff,
+                                    int frame_width,
+                                    float distance_threshold)
 {
-    if (fd < 0)
+    uint8_t status = 0;
+    if (debuff != nullptr)
     {
-        return;
+        status |= 0x01;
+        const float center_x = debuff->box.x + debuff->box.width * 0.5f;
+        if (center_x < frame_width * 0.5f)
+        {
+            status |= 0x04;
+        }
     }
+    if (buff != nullptr)
+    {
+        status |= 0x02;
+        const float center_x = buff->box.x + buff->box.width * 0.5f;
+        if (center_x < frame_width * 0.5f)
+        {
+            status |= 0x08;
+        }
+    }
+    const Detection *priority = debuff != nullptr ? debuff : buff;
+    if (priority != nullptr && priority->box.width > 0.0f &&
+        5000.0f / priority->box.width <= distance_threshold)
+    {
+        status |= 0x10;
+    }
+    return status;
+}
 
-    uint8_t packet[8];
-    packet[0] = 0xAA;//帧头
-    packet[1] = target_type;//目标类型
-    const uint16_t encoded_dx = static_cast<uint16_t>(delta_x);
-    packet[2] = static_cast<uint8_t>((encoded_dx >> 8) & 0xFF);
-    packet[3] = static_cast<uint8_t>(encoded_dx & 0xFF);
-    packet[4] = static_cast<uint8_t>((distance >> 8) & 0xFF);
-    packet[5] = static_cast<uint8_t>(distance & 0xFF);
-    packet[6] = static_cast<uint8_t>((packet[1] + packet[2] + packet[3] +
-                                      packet[4] + packet[5]) &
-                                     0xFF);
-    packet[7] = 0xBB;
-    (void)write(fd, packet, sizeof(packet));
+static void send_target_status(int fd, uint8_t status)
+{
+    if (fd >= 0)
+    {
+        (void)write(fd, &status, sizeof(status));
+    }
 }
 
 static LetterboxInfo letterbox(const cv::Mat &src, cv::Mat &dst, int size)
@@ -1012,16 +1042,25 @@ int main(int argc, char **argv)
                 target_type = 0x01;
             }
 
-            int16_t delta_x = 0;
-            int16_t distance = 0;
-            if (target_type != 0x00 && target.box.width > 0.0f)
+            Detection debuff_status_target;
+            Detection buff_status_target;
+            bool has_debuff = yolo_ran &&
+                              select_largest_class(detections, 1, debuff_status_target);
+            bool has_buff = yolo_ran &&
+                            select_largest_class(detections, 0, buff_status_target);
+            if (target_type == 0x01 && !has_buff)
             {
-                const float cx = target.box.x + target.box.width * 0.5f;
-                delta_x = static_cast<int16_t>(std::round(cx - frame.cols * 0.5f));
-                distance = static_cast<int16_t>(std::round(5000.0f / target.box.width));
+                buff_status_target = target;
+                has_buff = true;
             }
-            // 串口通信发送
-            send_target_data(serial_fd, target_type, delta_x, distance);
+
+            // Presence and direction are independent for the two classes.
+            // If both are visible, the distance flag follows debuff priority.
+            const uint8_t status = encode_target_status(
+                has_debuff ? &debuff_status_target : nullptr,
+                has_buff ? &buff_status_target : nullptr,
+                frame.cols, opt.distance_threshold);
+            send_target_status(serial_fd, status);
 
             display = frame.clone();
             draw_detections(display, detections);
@@ -1052,12 +1091,9 @@ int main(int argc, char **argv)
                             0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
             }
 
-            if (target_type != 0x00)
-            {
-                std::string dx_text = "dx: " + std::to_string(delta_x);
-                cv::putText(display, dx_text, cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
-                            0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            }
+            const std::string status_text = cv::format("Serial: 0x%02X", status);
+            cv::putText(display, status_text, cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
+                        0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
             const std::string mode_text = debuff_priority
                                               ? (target_type == 0x02 ? "Mode: DEBUFF YOLO" : "Mode: DEBUFF SEARCH")
                                               : (yolo_ran ? "Mode: YOLO" : "Mode: GAIN FLOW+HSV");

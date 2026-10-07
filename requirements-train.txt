@@ -1,0 +1,6 @@
+# Install the CUDA build of PyTorch appropriate for the training computer first.
+ultralytics==8.4.21
+numpy>=1.26
+opencv-python>=4.8
+ncnn==1.0.20260526
+pytest>=8
