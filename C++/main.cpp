@@ -1048,10 +1048,27 @@ int main(int argc, char **argv)
                               select_largest_class(detections, 1, debuff_status_target);
             bool has_buff = yolo_ran &&
                             select_largest_class(detections, 0, buff_status_target);
+            const bool buff_from_yolo = has_buff;
             if (target_type == 0x01 && !has_buff)
             {
                 buff_status_target = target;
                 has_buff = true;
+            }
+
+            if (has_debuff && debuff_status_target.box.width > 0.0f)
+            {
+                std::cout << "[frame " << frame_index << "] 减益块 [YOLO] 距离估算值="
+                          << cv::format("%.2f", 5000.0f / debuff_status_target.box.width)
+                          << " 框宽=" << cv::format("%.2f", debuff_status_target.box.width)
+                          << "px" << std::endl;
+            }
+            if (has_buff && buff_status_target.box.width > 0.0f)
+            {
+                std::cout << "[frame " << frame_index << "] 增益块 ["
+                          << (buff_from_yolo ? "YOLO" : "FLOW") << "] 距离估算值="
+                          << cv::format("%.2f", 5000.0f / buff_status_target.box.width)
+                          << " 框宽=" << cv::format("%.2f", buff_status_target.box.width)
+                          << "px" << std::endl;
             }
 
             // Presence and direction are independent for the two classes.
